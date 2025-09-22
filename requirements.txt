@@ -1,0 +1,23 @@
+# Core app framework
+streamlit==1.49.1
+
+# Data handling
+pandas==2.3.2
+numpy==2.3.3
+
+# Machine learning
+scikit-learn==1.7.2
+joblib==1.5.2
+
+# NLP
+nltk==3.9.1
+
+# Visualization
+matplotlib==3.10.6
+
+# Utilities
+requests==2.32.5
+tqdm==4.67.1
+
+# Optional: if you use word clouds or extra analysis
+wordcloud==1.9.3
