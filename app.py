@@ -1,7 +1,10 @@
-# app.py — Hybrid Sentiment Analysis Dashboard (patched: safe chunked filters + friendly messages)
+# app.py — Hybrid Sentiment Analysis Dashboard
+# Fast-mode: sample first -> label -> filter (safe for Streamlit Cloud)
+# Full-mode: label the active dataframe (use locally for very large datasets)
 
 # --- STARTUP GUARD ---
-import os, sys
+import os
+import sys
 from pathlib import Path
 import streamlit as st
 
@@ -9,12 +12,12 @@ ROOT = Path(__file__).parent.resolve()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Ensure src is a package
+# ensure src package exists
 if not (ROOT / "src" / "__init__.py").exists():
     (ROOT / "src").mkdir(parents=True, exist_ok=True)
     (ROOT / "src" / "__init__.py").write_text("# auto-created\n")
 
-# Create processed dir and demo CSV if empty
+# create processed dir and a small demo csv if empty
 processed_dir = ROOT / "data" / "processed"
 processed_dir.mkdir(parents=True, exist_ok=True)
 if not any(processed_dir.glob("*.csv")):
@@ -25,9 +28,9 @@ if not any(processed_dir.glob("*.csv")):
         "2,1001,DemoBrand,Demo Lipstick,\"Not what I expected, too dry\",2,2023-07-15,29.99,False\n"
         "3,1002,DemoBrand,Demo Mascara,\"Okay for the price\",3,2023-06-10,15.00,True\n"
     )
-    print("[startup] Demo CSV created:", demo_csv)
+    print("[startup] demo CSV created at", demo_csv)
 
-# Safe model loader
+# model loader (optional)
 PIPE = None
 MODEL_PATH = ROOT / "models" / "tfidf_lr.joblib"
 try:
@@ -36,14 +39,14 @@ try:
         PIPE = joblib.load(MODEL_PATH)
         print("[startup] Model loaded")
     else:
-        print("[startup] Model not found, continuing without ML model")
+        print("[startup] Model not found; continuing without ML model")
 except Exception as e:
     print("[startup] Model load failed:", e)
 
 st.session_state.setdefault("PIPE", PIPE)
 st.session_state.setdefault("PROCESSED_DIR", str(processed_dir))
 
-# Ensure NLTK Vader is available
+# Ensure vader lexicon present
 try:
     import nltk
     nltk.data.find("sentiment/vader_lexicon.zip")
@@ -54,16 +57,16 @@ except Exception:
         print("[startup] Failed to download vader lexicon:", e)
 # --- END STARTUP GUARD ---
 
+# imports
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from wordcloud import WordCloud
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
-# --- Helpers ---
+# ---------------- Helpers ----------------
 
 def safe_read_csv(path_or_buffer, max_rows_for_ui=250000):
-    """Read *up to* max_rows_for_ui rows for interactive UI to avoid OOM."""
+    """Read up to max_rows_for_ui rows for the interactive UI to avoid OOM/timeouts."""
     try:
         if hasattr(path_or_buffer, "read"):
             # uploaded file-like
@@ -80,47 +83,48 @@ def safe_read_csv(path_or_buffer, max_rows_for_ui=250000):
                 return df.sample(n=max_rows_for_ui, random_state=42).reset_index(drop=True)
             return df
         else:
-            # filepath
+            # filepath (read only first max_rows_for_ui rows)
             return pd.read_csv(path_or_buffer, nrows=max_rows_for_ui, low_memory=False)
     except Exception as e:
         print("[safe_read_csv] Failed:", e)
         return pd.DataFrame()
 
 def safe_sample(df, n, random_state=42):
+    """Return a sample of df or empty df if none."""
     if df is None or df.empty:
         return df.head(0)
     n_eff = min(max(0, int(n)), len(df))
-    return df.sample(n=n_eff, random_state=random_state) if n_eff > 0 else df.head(0)
+    return df.sample(n=n_eff, random_state=random_state).reset_index(drop=True) if n_eff > 0 else df.head(0)
 
 def ml_predict_safe(texts):
-    """Wrap model prediction; returns (preds, confs)."""
+    """Return (preds, confs). If no model available returns (None, 0.0)."""
     pipe = st.session_state.get("PIPE", None)
     if pipe is None:
-        return [None]*len(texts), [0.0]*len(texts)
+        return [None] * len(texts), [0.0] * len(texts)
     try:
         preds = pipe.predict(texts)
         try:
             probs = pipe.predict_proba(texts)
             confs = list(probs.max(axis=1))
         except Exception:
-            confs = [0.0]*len(texts)
+            confs = [0.0] * len(texts)
         return preds, confs
     except Exception as e:
         print("[ml_predict_safe] failed:", e)
-        return [None]*len(texts), [0.0]*len(texts)
+        return [None] * len(texts), [0.0] * len(texts)
 
 def hybrid_label(row):
+    """Return a hybrid label (priority: confident ML -> rating heuristic -> vader)."""
     vader = SentimentIntensityAnalyzer()
-    text = row.get('text_clean', "") or ""
-    score = vader.polarity_scores(text)['compound']
+    text = (row.get("text_clean") or "")
+    score = vader.polarity_scores(text)["compound"]
     label_vader = "positive" if score > 0.05 else "negative" if score < -0.05 else "neutral"
 
     preds, confs = ml_predict_safe([text])
     label_ml, conf = preds[0], confs[0]
 
-    # priority: confident ML, then rating heuristic, then vader
     try:
-        rating = float(row.get('review_rating', np.nan))
+        rating = float(row.get("review_rating", np.nan))
     except Exception:
         rating = np.nan
 
@@ -130,12 +134,11 @@ def hybrid_label(row):
         return "positive"
     return label_vader
 
-# Chunked unique extraction for filter options (memory-safe)
 def unique_values_from_csv(path_or_buffer, colname, chunksize=200_000):
+    """Return sorted unique non-null values for colname from CSV path or uploaded file-like (memory-safe)."""
     vals = set()
     try:
         if hasattr(path_or_buffer, "read"):
-            # file-like (uploaded); we will attempt chunk reading, but ensure pointer reset
             try:
                 path_or_buffer.seek(0)
             except Exception:
@@ -154,9 +157,8 @@ def unique_values_from_csv(path_or_buffer, colname, chunksize=200_000):
     return sorted(v for v in vals if pd.notna(v))
 
 def numeric_min_max_from_csv(path_or_buffer, colname, chunksize=200_000):
-    """Return (min, max) for numeric column from CSV in chunks. Returns (None, None) if none."""
-    mins = []
-    maxs = []
+    """Return (min, max) numeric values for colname from CSV in chunks; (None, None) if missing."""
+    mins, maxs = [], []
     try:
         if hasattr(path_or_buffer, "read"):
             try:
@@ -182,179 +184,185 @@ def numeric_min_max_from_csv(path_or_buffer, colname, chunksize=200_000):
         return None, None
     return float(min(mins)), float(max(maxs))
 
-# --- UI ---
+# ---------------- UI ----------------
 
 st.set_page_config(page_title="💄✨ Hybrid Sentiment Analysis", layout="wide")
 st.title("💄✨ Hybrid Sentiment Analysis — Fashion & Cosmetics")
 
-# 📘 User Manual (collapsible)
+# User manual as expander
 with st.expander("📘 User Manual", expanded=False):
     st.markdown("""
     **Quick guide**
-    - Upload a CSV or pick a processed file from the sidebar.
-    - Expected columns (recommended): `review_text` (or `text`), `review_rating`, `brand_name`, `product_id`, `product_title`, `review_date`, `price`, `verified_purchases`.
-    - Use **Fast** mode on Cloud for a quick demo (samples), **Full** mode locally for full dataset processing.
-    - If a filter returns no rows, try removing filters or switch to Full mode locally.
+    - Upload a CSV or choose a processed file from the sidebar.
+    - Recommended columns: `review_text` (or `text`), `review_rating`, `brand_name`, `product_id`, `product_title`, `review_date`, `price`, `verified_purchases`.
+    - **Fast (sample)** mode: quick demo (1000 rows) suitable for Streamlit Cloud.
+    - **Full (all rows)** mode: compute labels for whole active DataFrame — use locally for large datasets.
+    - If filters return no rows, remove filters or switch to Full mode locally.
     """)
 
 st.sidebar.header("Data & Controls")
 
-# Upload or choose dataset
+# file upload or choose processed dataset
 upload = st.sidebar.file_uploader("Upload a CSV file (optional)", type="csv")
 available_files = list(Path(st.session_state["PROCESSED_DIR"]).glob("*.csv"))
-# Show readable names but keep path for loading
 sel_file = st.sidebar.selectbox("Choose processed dataset", available_files)
 
-# Build filter option values (memory-safe) from full file (or uploaded file-like)
-# We extract only necessary columns for filters: brand_name, price, verified_purchases
+# Pre-scan necessary columns for filters from the full file (memory-safe)
 brand_options = []
 price_min_max = (None, None)
 verified_options_exist = False
+
 try:
     if upload:
         brand_options = unique_values_from_csv(upload, "brand_name")
         price_min_max = numeric_min_max_from_csv(upload, "price")
-        # detect verified column presence
-        verified_options = unique_values_from_csv(upload, "verified_purchases")
-        verified_options_exist = len(verified_options) > 0
+        verified_values = unique_values_from_csv(upload, "verified_purchases")
+        verified_options_exist = len(verified_values) > 0
     else:
         brand_options = unique_values_from_csv(sel_file, "brand_name")
         price_min_max = numeric_min_max_from_csv(sel_file, "price")
-        verified_options = unique_values_from_csv(sel_file, "verified_purchases")
-        verified_options_exist = len(verified_options) > 0
+        verified_values = unique_values_from_csv(sel_file, "verified_purchases")
+        verified_options_exist = len(verified_values) > 0
 except Exception as e:
     print("[filter-prep] warning:", e)
 
-# Load sample/safe dataset for analytics (not the full heavy read)
+# Load an active dataframe for analytics (bounded size for UI)
 if upload:
-    df = safe_read_csv(upload)
+    df_active = safe_read_csv(upload)
 else:
-    df = safe_read_csv(sel_file)
+    df_active = safe_read_csv(sel_file)
 
-if df is None or df.empty:
+if df_active is None or df_active.empty:
     st.error("No data loaded. Upload a CSV or add processed CSVs to data/processed.")
     st.stop()
 
-# normalize display column
-display_col = "review_text" if "review_text" in df.columns else ("text" if "text" in df.columns else None)
+# choose display text column
+display_col = "review_text" if "review_text" in df_active.columns else ("text" if "text" in df_active.columns else None)
 if display_col is None:
-    st.error("Dataset needs a text column named 'review_text' or 'text'.")
+    st.error("Dataset must have 'review_text' or 'text' column.")
     st.stop()
-df['text_clean'] = df[display_col].astype(str).fillna("")
+df_active["text_clean"] = df_active[display_col].astype(str).fillna("")
 
-# Fast vs Full: compute labels BEFORE filters (but in Fast mode compute only on a sample)
+# performance mode: we will handle Fast vs Full differently (Fast: sample FIRST -> label -> filters)
 st.sidebar.markdown("### ⚡ Performance mode")
 mode = st.sidebar.radio("Choose analysis mode:", ["Fast (sample only)", "Full (all rows)"], index=0)
 
-if "hybrid_label" not in df.columns:
+# --- Sample-first for Fast --- compute labels on the sample, not on entire loaded df_active
+if "hybrid_label" not in df_active.columns:
     if mode == "Full (all rows)":
-        st.info("Computing hybrid labels for **all rows** — this may take a while (use locally).")
-        df['hybrid_label'] = df.apply(hybrid_label, axis=1)
+        st.info("Computing hybrid labels for active dataframe (Full mode). This may take a while — run locally for big data.")
+        # compute on full (active) dataframe (note: df_active is already bounded by safe_read_csv)
+        df_active["hybrid_label"] = df_active.apply(hybrid_label, axis=1)
     else:
-        st.warning("Hybrid labels not precomputed — using 1000-row sample for demo.")
-        sample_df = safe_sample(df, 1000)
-        sample_df['hybrid_label'] = sample_df.apply(hybrid_label, axis=1)
-        df = sample_df.reset_index(drop=True)
+        st.warning("Hybrid labels not precomputed — sampling 1000 rows for a fast demo.")
+        sample_df = safe_sample(df_active, 1000)
+        sample_df["hybrid_label"] = sample_df.apply(hybrid_label, axis=1)
+        df_active = sample_df
 
 label_col = "hybrid_label"
 
-# --- Filters (applied after labels) ---
-# Brand filter (use values from full CSV if available)
+# --- BUILD FILTER WIDGETS (use pre-scanned brand_options, price_min_max, verified_options_exist) ---
 if brand_options:
     sel_brand = st.sidebar.multiselect("Filter by brand", brand_options)
 else:
     sel_brand = []
     st.sidebar.info("No brand options to select. Upload a dataset or switch to Full mode.")
 
-if sel_brand:
-    # If df doesn't contain brand_name column (e.g. small demo), skip gracefully
-    if 'brand_name' in df.columns:
-        df = df[df['brand_name'].isin(sel_brand)]
-    else:
-        st.warning("Selected brand(s) exist in full file but not in the active sample. Try switching to Full mode.")
-
-# Price filter (safe)
+# Price slider using pre-scanned min/max
 if price_min_max and price_min_max != (None, None):
-    min_p, max_p = price_min_max
-    # ensure sane order
-    if min_p is not None and max_p is not None and min_p <= max_p:
-        sel_p = st.sidebar.slider("Price range", min_p, max_p, (min_p, max_p))
-        if 'price' in df.columns:
-            df = df[(pd.to_numeric(df['price'], errors='coerce') >= sel_p[0]) & (pd.to_numeric(df['price'], errors='coerce') <= sel_p[1])]
+    pmin, pmax = price_min_max
+    if pmin is not None and pmax is not None and pmin <= pmax:
+        sel_p = st.sidebar.slider("Price range", float(pmin), float(pmax), (float(pmin), float(pmax)))
     else:
+        sel_p = None
         st.sidebar.info("Price values not available.")
 else:
+    sel_p = None
     st.sidebar.info("⚠️ Price data not available for this dataset")
 
 # Verified purchases filter
 if verified_options_exist:
     vp_filter = st.sidebar.radio("Verified purchase filter", ["All", "Verified only"])
-    if vp_filter == "Verified only":
-        if 'verified_purchases' in df.columns:
-            # coerce to boolean-ish
-            df = df[df['verified_purchases'].astype(str).str.lower().isin(['true','1','yes'])]
-        else:
-            st.sidebar.info("Verified purchase column not present in active sample; try Full mode.")
 else:
+    vp_filter = "All"
     st.sidebar.info("No verified purchase info available in the dataset")
 
-# After filters applied -> check emptiness
-if df is None or df.empty:
+# --- APPLY FILTERS (after labels exist) ---
+# brand
+if sel_brand:
+    if "brand_name" in df_active.columns:
+        df_active = df_active[df_active["brand_name"].isin(sel_brand)]
+    else:
+        st.warning("Selected brand(s) exist in the full file but not in the active sample. Try Full mode for a complete run.")
+
+# price
+if sel_p is not None and "price" in df_active.columns:
+    df_active = df_active[(pd.to_numeric(df_active["price"], errors="coerce") >= sel_p[0]) &
+                          (pd.to_numeric(df_active["price"], errors="coerce") <= sel_p[1])]
+
+# verified purchases
+if vp_filter == "Verified only":
+    if "verified_purchases" in df_active.columns:
+        df_active = df_active[df_active["verified_purchases"].astype(str).str.lower().isin(["true","1","yes"])]
+    else:
+        st.sidebar.info("Verified column not present in active sample; try Full mode.")
+
+# if filters removed everything, stop gracefully
+if df_active is None or df_active.empty:
     st.warning("No data after applying filters. Try removing filters or switch to Full mode for a complete run.")
     st.stop()
 
-# --- Analytics ---
+# ---------------- Analytics (based on df_active) ----------------
 
 st.subheader("Analytics Dashboard (filtered)")
-st.write(f"Rows in active view: {len(df)}")
+st.write(f"Rows in active view: {len(df_active)}")
 
-# Label counts (safe)
-st.write("Label counts:", df[label_col].value_counts().to_dict())
+# label counts
+st.write("Label counts:", df_active[label_col].value_counts().to_dict())
 
-# Sentiment distribution (bar chart)
-st.bar_chart(df[label_col].value_counts())
+# sentiment distribution
+st.bar_chart(df_active[label_col].value_counts())
 
-# WordClouds by sentiment
+# Top keywords by sentiment (wordclouds)
 st.subheader("Top keywords by sentiment (filtered sample)")
 sample_n = st.slider("Sample size for keywords", 100, 5000, 500)
-sample_df = safe_sample(df[['text_clean', label_col]].dropna(), sample_n)
-
-if sample_df is None or sample_df.empty:
+kw_sample = safe_sample(df_active[["text_clean", label_col]].dropna(), sample_n)
+if kw_sample is None or kw_sample.empty:
     st.info("No text samples available for keyword extraction.")
 else:
     for sentiment in ["positive", "negative", "neutral"]:
-        text = " ".join(sample_df[sample_df[label_col]==sentiment]['text_clean'].astype(str).tolist())
+        text = " ".join(kw_sample[kw_sample[label_col] == sentiment]["text_clean"].astype(str).tolist())
         if text.strip():
             wc = WordCloud(width=600, height=400, background_color="white").generate(text)
             st.image(wc.to_array(), caption=f"WordCloud — {sentiment}")
 
-# Product-level rollups
-if 'product_id' in df.columns:
+# Product-level rollups & download
+if "product_id" in df_active.columns:
     st.subheader("Product-level rollups (filtered)")
-    rollup = df.groupby(['product_id','product_title','brand_name'], dropna=False).agg(
-        n_reviews = (label_col,'count'),
-        positive_share = (label_col, lambda s: (s=="positive").mean()),
-        avg_rating = ('review_rating','mean') if 'review_rating' in df.columns else ('rating','mean')
+    rollup = df_active.groupby(["product_id", "product_title", "brand_name"], dropna=False).agg(
+        n_reviews = (label_col, "count"),
+        positive_share = (label_col, lambda s: (s == "positive").mean()),
+        avg_rating = ("review_rating", "mean") if "review_rating" in df_active.columns else ("rating", "mean")
     ).reset_index()
     st.dataframe(rollup.head(50))
-    csv = rollup.to_csv(index=False).encode("utf-8")
-    st.download_button("📥 Download product rollups CSV", csv, "product_rollups.csv", "text/csv")
+    csv_out = rollup.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 Download product rollups CSV", csv_out, "product_rollups.csv", "text/csv")
 else:
     st.info("product_id column not present — product rollups unavailable.")
 
 # Time trends
-if 'review_date' in df.columns:
+if "review_date" in df_active.columns:
     st.subheader("Sentiment trends over time")
-    time_df = df.copy()
-    time_df['review_date'] = pd.to_datetime(time_df['review_date'], errors='coerce')
-    time_df['_period'] = time_df['review_date'].dt.to_period('M')
-    monthly = time_df.groupby('_period').agg(
-        n_reviews = (label_col,'count'),
-        positive_share = (label_col, lambda s: (s=="positive").mean()),
-        avg_rating = ('review_rating','mean') if 'review_rating' in time_df.columns else ('rating','mean')
+    time_df = df_active.copy()
+    time_df["review_date"] = pd.to_datetime(time_df["review_date"], errors="coerce")
+    time_df["_period"] = time_df["review_date"].dt.to_period("M")
+    monthly = time_df.groupby("_period").agg(
+        n_reviews = (label_col, "count"),
+        positive_share = (label_col, lambda s: (s == "positive").mean()),
+        avg_rating = ("review_rating", "mean") if "review_rating" in time_df.columns else ("rating", "mean")
     ).reset_index()
     if not monthly.empty:
-        st.line_chart(monthly.set_index('_period')[['positive_share','avg_rating']])
+        st.line_chart(monthly.set_index("_period")[["positive_share", "avg_rating"]])
     else:
         st.info("Not enough dated reviews to show trends.")
 else:
@@ -369,3 +377,5 @@ if st.button("Predict sentiment"):
     row = {"text_clean": user_text, "review_rating": user_rating}
     label = hybrid_label(row)
     st.success(f"Predicted sentiment: {label}")
+
+# End of file
