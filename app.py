@@ -1,4 +1,4 @@
-# app.py — Hybrid Sentiment Analysis Dashboard (stable version with fixes)
+# app.py — Hybrid Sentiment Analysis Dashboard (correct filter flow)
 
 # --- STARTUP GUARD ---
 import os, sys
@@ -159,7 +159,7 @@ if df.empty:
 display_col = "review_text" if "review_text" in df.columns else "text"
 df['text_clean'] = df[display_col].astype(str).fillna("")
 
-# 🚀 Fast vs Full toggle
+# 🚀 Fast vs Full toggle (compute hybrid labels FIRST)
 st.sidebar.markdown("### ⚡ Performance mode")
 mode = st.sidebar.radio("Choose analysis mode:", ["Fast (sample only)", "Full (all rows)"], index=0)
 
@@ -175,13 +175,13 @@ if "hybrid_label" not in df.columns:
 
 label_col = "hybrid_label"
 
-# Filters
-brands = df['brand_name'].dropna().unique().tolist() if 'brand_name' in df.columns else []
-sel_brand = st.sidebar.multiselect("Filter by brand", brands)
-if sel_brand:
-    df = df[df['brand_name'].isin(sel_brand)]
+# --- Filters (applied AFTER labels) ---
+if 'brand_name' in df.columns:
+    brands = df['brand_name'].dropna().unique().tolist()
+    sel_brand = st.sidebar.multiselect("Filter by brand", brands)
+    if sel_brand:
+        df = df[df['brand_name'].isin(sel_brand)]
 
-# ✅ FIX: Safe price slider
 if 'price' in df.columns:
     price_series = pd.to_numeric(df['price'], errors="coerce").dropna()
     if not price_series.empty:
