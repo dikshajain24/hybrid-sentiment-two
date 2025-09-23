@@ -1,4 +1,4 @@
-# app.py — Hybrid Sentiment Analysis Dashboard (correct filter flow)
+# app.py — Hybrid Sentiment Analysis Dashboard (patched: safe chunked filters + friendly messages)
 
 # --- STARTUP GUARD ---
 import os, sys
@@ -20,10 +20,10 @@ processed_dir.mkdir(parents=True, exist_ok=True)
 if not any(processed_dir.glob("*.csv")):
     demo_csv = processed_dir / "combined_demo.csv"
     demo_csv.write_text(
-        "review_id,product_id,brand_name,review_text,review_rating,review_date\n"
-        "1,1001,DemoBrand,\"Love this lipstick — color pops and lasts!\",5,2023-08-01\n"
-        "2,1001,DemoBrand,\"Not what I expected, too dry\",2,2023-07-15\n"
-        "3,1002,DemoBrand,\"Okay for the price\",3,2023-06-10\n"
+        "review_id,product_id,brand_name,product_title,review_text,review_rating,review_date,price,verified_purchases\n"
+        "1,1001,DemoBrand,Demo Lipstick,\"Love this lipstick — color pops and lasts!\",5,2023-08-01,29.99,True\n"
+        "2,1001,DemoBrand,Demo Lipstick,\"Not what I expected, too dry\",2,2023-07-15,29.99,False\n"
+        "3,1002,DemoBrand,Demo Mascara,\"Okay for the price\",3,2023-06-10,15.00,True\n"
     )
     print("[startup] Demo CSV created:", demo_csv)
 
@@ -63,14 +63,25 @@ from nltk.sentiment.vader import SentimentIntensityAnalyzer
 # --- Helpers ---
 
 def safe_read_csv(path_or_buffer, max_rows_for_ui=250000):
+    """Read *up to* max_rows_for_ui rows for interactive UI to avoid OOM."""
     try:
-        if isinstance(path_or_buffer, (str, Path)):
-            return pd.read_csv(path_or_buffer, nrows=max_rows_for_ui, low_memory=False)
-        else:
+        if hasattr(path_or_buffer, "read"):
+            # uploaded file-like
+            try:
+                path_or_buffer.seek(0)
+            except Exception:
+                pass
             df = pd.read_csv(path_or_buffer, low_memory=False)
+            try:
+                path_or_buffer.seek(0)
+            except Exception:
+                pass
             if len(df) > max_rows_for_ui:
                 return df.sample(n=max_rows_for_ui, random_state=42).reset_index(drop=True)
             return df
+        else:
+            # filepath
+            return pd.read_csv(path_or_buffer, nrows=max_rows_for_ui, low_memory=False)
     except Exception as e:
         print("[safe_read_csv] Failed:", e)
         return pd.DataFrame()
@@ -82,6 +93,7 @@ def safe_sample(df, n, random_state=42):
     return df.sample(n=n_eff, random_state=random_state) if n_eff > 0 else df.head(0)
 
 def ml_predict_safe(texts):
+    """Wrap model prediction; returns (preds, confs)."""
     pipe = st.session_state.get("PIPE", None)
     if pipe is None:
         return [None]*len(texts), [0.0]*len(texts)
@@ -99,73 +111,144 @@ def ml_predict_safe(texts):
 
 def hybrid_label(row):
     vader = SentimentIntensityAnalyzer()
-    score = vader.polarity_scores(row['text_clean'])['compound']
+    text = row.get('text_clean', "") or ""
+    score = vader.polarity_scores(text)['compound']
     label_vader = "positive" if score > 0.05 else "negative" if score < -0.05 else "neutral"
 
-    preds, confs = ml_predict_safe([row['text_clean']])
+    preds, confs = ml_predict_safe([text])
     label_ml, conf = preds[0], confs[0]
+
+    # priority: confident ML, then rating heuristic, then vader
+    try:
+        rating = float(row.get('review_rating', np.nan))
+    except Exception:
+        rating = np.nan
 
     if label_ml is not None and conf >= 0.8:
         return label_ml
-    if row.get('review_rating', np.nan) >= 4 and label_vader != "negative":
+    if not np.isnan(rating) and rating >= 4 and label_vader != "negative":
         return "positive"
     return label_vader
+
+# Chunked unique extraction for filter options (memory-safe)
+def unique_values_from_csv(path_or_buffer, colname, chunksize=200_000):
+    vals = set()
+    try:
+        if hasattr(path_or_buffer, "read"):
+            # file-like (uploaded); we will attempt chunk reading, but ensure pointer reset
+            try:
+                path_or_buffer.seek(0)
+            except Exception:
+                pass
+            for chunk in pd.read_csv(path_or_buffer, usecols=[colname], chunksize=chunksize, low_memory=False):
+                vals.update(chunk[colname].dropna().unique().tolist())
+            try:
+                path_or_buffer.seek(0)
+            except Exception:
+                pass
+        else:
+            for chunk in pd.read_csv(path_or_buffer, usecols=[colname], chunksize=chunksize, low_memory=False):
+                vals.update(chunk[colname].dropna().unique().tolist())
+    except Exception as e:
+        print(f"[unique_values_from_csv] failed for column {colname}: {e}")
+    return sorted(v for v in vals if pd.notna(v))
+
+def numeric_min_max_from_csv(path_or_buffer, colname, chunksize=200_000):
+    """Return (min, max) for numeric column from CSV in chunks. Returns (None, None) if none."""
+    mins = []
+    maxs = []
+    try:
+        if hasattr(path_or_buffer, "read"):
+            try:
+                path_or_buffer.seek(0)
+            except Exception:
+                pass
+            for chunk in pd.read_csv(path_or_buffer, usecols=[colname], chunksize=chunksize, low_memory=False):
+                ser = pd.to_numeric(chunk[colname], errors="coerce").dropna()
+                if not ser.empty:
+                    mins.append(ser.min()); maxs.append(ser.max())
+            try:
+                path_or_buffer.seek(0)
+            except Exception:
+                pass
+        else:
+            for chunk in pd.read_csv(path_or_buffer, usecols=[colname], chunksize=chunksize, low_memory=False):
+                ser = pd.to_numeric(chunk[colname], errors="coerce").dropna()
+                if not ser.empty:
+                    mins.append(ser.min()); maxs.append(ser.max())
+    except Exception as e:
+        print(f"[numeric_min_max_from_csv] failed for {colname}: {e}")
+    if not mins:
+        return None, None
+    return float(min(mins)), float(max(maxs))
 
 # --- UI ---
 
 st.set_page_config(page_title="💄✨ Hybrid Sentiment Analysis", layout="wide")
 st.title("💄✨ Hybrid Sentiment Analysis — Fashion & Cosmetics")
 
-# 📘 User Manual / Instructions (dropdown)
+# 📘 User Manual (collapsible)
 with st.expander("📘 User Manual", expanded=False):
     st.markdown("""
-    Welcome to the **Hybrid Sentiment Analysis Dashboard** for Fashion & Cosmetics!  
-
-    **How to use:**
-    1. **Upload a CSV** or choose from preprocessed datasets (sidebar).  
-       - Expected columns: `review_text` (or `text`), `review_rating`, `brand_name`, `product_id`, `review_date`.  
-    2. **Filters**: Narrow down reviews by brand, price range, or verified purchase.  
-    3. **Dashboard Sections**:
-       - Sentiment Distribution → Positive/Negative/Neutral split  
-       - Word Clouds → Top keywords per sentiment  
-       - Product Rollups → Reviews, ratings, positive share per product  
-       - Trends → Sentiment & ratings over time  
-       - Download CSV → Export aggregated insights  
-       - Single Review Prediction → Paste text and get instant sentiment  
-    4. **Performance Mode**:
-       - *Fast (sample only)* → Quick demo (default on Cloud)  
-       - *Full (all rows)* → Runs entire dataset (use locally)  
-
-    ⚡ **Tip**: On Streamlit Cloud, always use **Fast Mode** for responsiveness.
+    **Quick guide**
+    - Upload a CSV or pick a processed file from the sidebar.
+    - Expected columns (recommended): `review_text` (or `text`), `review_rating`, `brand_name`, `product_id`, `product_title`, `review_date`, `price`, `verified_purchases`.
+    - Use **Fast** mode on Cloud for a quick demo (samples), **Full** mode locally for full dataset processing.
+    - If a filter returns no rows, try removing filters or switch to Full mode locally.
     """)
 
 st.sidebar.header("Data & Controls")
 
 # Upload or choose dataset
-upload = st.sidebar.file_uploader("Upload a CSV file", type="csv")
+upload = st.sidebar.file_uploader("Upload a CSV file (optional)", type="csv")
 available_files = list(Path(st.session_state["PROCESSED_DIR"]).glob("*.csv"))
+# Show readable names but keep path for loading
 sel_file = st.sidebar.selectbox("Choose processed dataset", available_files)
 
+# Build filter option values (memory-safe) from full file (or uploaded file-like)
+# We extract only necessary columns for filters: brand_name, price, verified_purchases
+brand_options = []
+price_min_max = (None, None)
+verified_options_exist = False
+try:
+    if upload:
+        brand_options = unique_values_from_csv(upload, "brand_name")
+        price_min_max = numeric_min_max_from_csv(upload, "price")
+        # detect verified column presence
+        verified_options = unique_values_from_csv(upload, "verified_purchases")
+        verified_options_exist = len(verified_options) > 0
+    else:
+        brand_options = unique_values_from_csv(sel_file, "brand_name")
+        price_min_max = numeric_min_max_from_csv(sel_file, "price")
+        verified_options = unique_values_from_csv(sel_file, "verified_purchases")
+        verified_options_exist = len(verified_options) > 0
+except Exception as e:
+    print("[filter-prep] warning:", e)
+
+# Load sample/safe dataset for analytics (not the full heavy read)
 if upload:
     df = safe_read_csv(upload)
 else:
     df = safe_read_csv(sel_file)
 
-if df.empty:
-    st.error("No data loaded. Please upload a CSV or check processed folder.")
+if df is None or df.empty:
+    st.error("No data loaded. Upload a CSV or add processed CSVs to data/processed.")
     st.stop()
 
-# Pick display + label columns
-display_col = "review_text" if "review_text" in df.columns else "text"
+# normalize display column
+display_col = "review_text" if "review_text" in df.columns else ("text" if "text" in df.columns else None)
+if display_col is None:
+    st.error("Dataset needs a text column named 'review_text' or 'text'.")
+    st.stop()
 df['text_clean'] = df[display_col].astype(str).fillna("")
 
-# 🚀 Fast vs Full toggle (compute hybrid labels FIRST)
+# Fast vs Full: compute labels BEFORE filters (but in Fast mode compute only on a sample)
 st.sidebar.markdown("### ⚡ Performance mode")
 mode = st.sidebar.radio("Choose analysis mode:", ["Fast (sample only)", "Full (all rows)"], index=0)
 
 if "hybrid_label" not in df.columns:
     if mode == "Full (all rows)":
-        st.info("Computing hybrid labels for **all rows** — may take a while ⏳")
+        st.info("Computing hybrid labels for **all rows** — this may take a while (use locally).")
         df['hybrid_label'] = df.apply(hybrid_label, axis=1)
     else:
         st.warning("Hybrid labels not precomputed — using 1000-row sample for demo.")
@@ -175,35 +258,60 @@ if "hybrid_label" not in df.columns:
 
 label_col = "hybrid_label"
 
-# --- Filters (applied AFTER labels) ---
-if 'brand_name' in df.columns:
-    brands = df['brand_name'].dropna().unique().tolist()
-    sel_brand = st.sidebar.multiselect("Filter by brand", brands)
-    if sel_brand:
+# --- Filters (applied after labels) ---
+# Brand filter (use values from full CSV if available)
+if brand_options:
+    sel_brand = st.sidebar.multiselect("Filter by brand", brand_options)
+else:
+    sel_brand = []
+    st.sidebar.info("No brand options to select. Upload a dataset or switch to Full mode.")
+
+if sel_brand:
+    # If df doesn't contain brand_name column (e.g. small demo), skip gracefully
+    if 'brand_name' in df.columns:
         df = df[df['brand_name'].isin(sel_brand)]
-
-if 'price' in df.columns:
-    price_series = pd.to_numeric(df['price'], errors="coerce").dropna()
-    if not price_series.empty:
-        min_p, max_p = float(price_series.min()), float(price_series.max())
-        sel_p = st.sidebar.slider("Price range", min_p, max_p, (min_p, max_p))
-        df = df[(df['price'] >= sel_p[0]) & (df['price'] <= sel_p[1])]
     else:
-        st.sidebar.info("⚠️ Price data not available for this dataset")
+        st.warning("Selected brand(s) exist in full file but not in the active sample. Try switching to Full mode.")
 
-if 'verified_purchases' in df.columns:
+# Price filter (safe)
+if price_min_max and price_min_max != (None, None):
+    min_p, max_p = price_min_max
+    # ensure sane order
+    if min_p is not None and max_p is not None and min_p <= max_p:
+        sel_p = st.sidebar.slider("Price range", min_p, max_p, (min_p, max_p))
+        if 'price' in df.columns:
+            df = df[(pd.to_numeric(df['price'], errors='coerce') >= sel_p[0]) & (pd.to_numeric(df['price'], errors='coerce') <= sel_p[1])]
+    else:
+        st.sidebar.info("Price values not available.")
+else:
+    st.sidebar.info("⚠️ Price data not available for this dataset")
+
+# Verified purchases filter
+if verified_options_exist:
     vp_filter = st.sidebar.radio("Verified purchase filter", ["All", "Verified only"])
     if vp_filter == "Verified only":
-        df = df[df['verified_purchases'] == True]
+        if 'verified_purchases' in df.columns:
+            # coerce to boolean-ish
+            df = df[df['verified_purchases'].astype(str).str.lower().isin(['true','1','yes'])]
+        else:
+            st.sidebar.info("Verified purchase column not present in active sample; try Full mode.")
+else:
+    st.sidebar.info("No verified purchase info available in the dataset")
+
+# After filters applied -> check emptiness
+if df is None or df.empty:
+    st.warning("No data after applying filters. Try removing filters or switch to Full mode for a complete run.")
+    st.stop()
 
 # --- Analytics ---
 
 st.subheader("Analytics Dashboard (filtered)")
-st.write("Rows:", len(df))
+st.write(f"Rows in active view: {len(df)}")
 
+# Label counts (safe)
 st.write("Label counts:", df[label_col].value_counts().to_dict())
 
-# Sentiment distribution
+# Sentiment distribution (bar chart)
 st.bar_chart(df[label_col].value_counts())
 
 # WordClouds by sentiment
@@ -211,24 +319,28 @@ st.subheader("Top keywords by sentiment (filtered sample)")
 sample_n = st.slider("Sample size for keywords", 100, 5000, 500)
 sample_df = safe_sample(df[['text_clean', label_col]].dropna(), sample_n)
 
-if not sample_df.empty:
+if sample_df is None or sample_df.empty:
+    st.info("No text samples available for keyword extraction.")
+else:
     for sentiment in ["positive", "negative", "neutral"]:
-        text = " ".join(sample_df[sample_df[label_col]==sentiment]['text_clean'])
-        if text:
+        text = " ".join(sample_df[sample_df[label_col]==sentiment]['text_clean'].astype(str).tolist())
+        if text.strip():
             wc = WordCloud(width=600, height=400, background_color="white").generate(text)
             st.image(wc.to_array(), caption=f"WordCloud — {sentiment}")
 
 # Product-level rollups
 if 'product_id' in df.columns:
-    st.subheader("Product-level rollups")
-    rollup = df.groupby(['product_id','product_title','brand_name']).agg(
+    st.subheader("Product-level rollups (filtered)")
+    rollup = df.groupby(['product_id','product_title','brand_name'], dropna=False).agg(
         n_reviews = (label_col,'count'),
         positive_share = (label_col, lambda s: (s=="positive").mean()),
         avg_rating = ('review_rating','mean') if 'review_rating' in df.columns else ('rating','mean')
     ).reset_index()
-    st.dataframe(rollup.head(20))
+    st.dataframe(rollup.head(50))
     csv = rollup.to_csv(index=False).encode("utf-8")
     st.download_button("📥 Download product rollups CSV", csv, "product_rollups.csv", "text/csv")
+else:
+    st.info("product_id column not present — product rollups unavailable.")
 
 # Time trends
 if 'review_date' in df.columns:
@@ -241,7 +353,12 @@ if 'review_date' in df.columns:
         positive_share = (label_col, lambda s: (s=="positive").mean()),
         avg_rating = ('review_rating','mean') if 'review_rating' in time_df.columns else ('rating','mean')
     ).reset_index()
-    st.line_chart(monthly.set_index('_period')[['positive_share','avg_rating']])
+    if not monthly.empty:
+        st.line_chart(monthly.set_index('_period')[['positive_share','avg_rating']])
+    else:
+        st.info("Not enough dated reviews to show trends.")
+else:
+    st.info("review_date column not present — trends unavailable.")
 
 # Single review prediction
 st.subheader("Single review prediction")
