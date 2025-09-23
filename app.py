@@ -1,4 +1,4 @@
-# app.py — Hybrid Sentiment Analysis Dashboard (with Fast/Full toggle + User Manual)
+# app.py — Hybrid Sentiment Analysis Dashboard (stable version with fixes)
 
 # --- STARTUP GUARD ---
 import os, sys
@@ -116,28 +116,28 @@ def hybrid_label(row):
 st.set_page_config(page_title="💄✨ Hybrid Sentiment Analysis", layout="wide")
 st.title("💄✨ Hybrid Sentiment Analysis — Fashion & Cosmetics")
 
-# 📘 User Manual / Instructions
-st.markdown("""
-## 📘 User Manual
-Welcome to the **Hybrid Sentiment Analysis Dashboard** for Fashion & Cosmetics!  
+# 📘 User Manual / Instructions (dropdown)
+with st.expander("📘 User Manual", expanded=False):
+    st.markdown("""
+    Welcome to the **Hybrid Sentiment Analysis Dashboard** for Fashion & Cosmetics!  
 
-Here’s how to use it:
-1. **Upload a CSV** or choose from preprocessed datasets (sidebar).  
-   - Expected columns: `review_text` (or `text`), `review_rating`, `brand_name`, `product_id`, `review_date`.  
-2. **Filters**: Narrow down reviews by brand, price range, or verified purchase.  
-3. **Dashboard Sections**:
-   - **Sentiment Distribution** → See how reviews split across positive/negative/neutral.  
-   - **Word Clouds** → Top keywords per sentiment.  
-   - **Product Rollups** → Review counts, avg rating, positive share per product.  
-   - **Trends** → Sentiment and rating trends over time.  
-   - **Download CSV** → Export aggregated product insights.  
-   - **Single Review Prediction** → Paste your own review and get instant sentiment.  
-4. **Performance Mode**:
-   - *Fast (sample only)* → Loads quickly (default on Cloud).  
-   - *Full (all rows)* → Computes sentiment for the entire dataset (use locally).  
+    **How to use:**
+    1. **Upload a CSV** or choose from preprocessed datasets (sidebar).  
+       - Expected columns: `review_text` (or `text`), `review_rating`, `brand_name`, `product_id`, `review_date`.  
+    2. **Filters**: Narrow down reviews by brand, price range, or verified purchase.  
+    3. **Dashboard Sections**:
+       - Sentiment Distribution → Positive/Negative/Neutral split  
+       - Word Clouds → Top keywords per sentiment  
+       - Product Rollups → Reviews, ratings, positive share per product  
+       - Trends → Sentiment & ratings over time  
+       - Download CSV → Export aggregated insights  
+       - Single Review Prediction → Paste text and get instant sentiment  
+    4. **Performance Mode**:
+       - *Fast (sample only)* → Quick demo (default on Cloud)  
+       - *Full (all rows)* → Runs entire dataset (use locally)  
 
-⚡ Tip: On **Streamlit Cloud**, always use **Fast Mode** for responsiveness.
-""")
+    ⚡ **Tip**: On Streamlit Cloud, always use **Fast Mode** for responsiveness.
+    """)
 
 st.sidebar.header("Data & Controls")
 
@@ -181,10 +181,15 @@ sel_brand = st.sidebar.multiselect("Filter by brand", brands)
 if sel_brand:
     df = df[df['brand_name'].isin(sel_brand)]
 
+# ✅ FIX: Safe price slider
 if 'price' in df.columns:
-    min_p, max_p = float(df['price'].min()), float(df['price'].max())
-    sel_p = st.sidebar.slider("Price range", min_p, max_p, (min_p, max_p))
-    df = df[(df['price'] >= sel_p[0]) & (df['price'] <= sel_p[1])]
+    price_series = pd.to_numeric(df['price'], errors="coerce").dropna()
+    if not price_series.empty:
+        min_p, max_p = float(price_series.min()), float(price_series.max())
+        sel_p = st.sidebar.slider("Price range", min_p, max_p, (min_p, max_p))
+        df = df[(df['price'] >= sel_p[0]) & (df['price'] <= sel_p[1])]
+    else:
+        st.sidebar.info("⚠️ Price data not available for this dataset")
 
 if 'verified_purchases' in df.columns:
     vp_filter = st.sidebar.radio("Verified purchase filter", ["All", "Verified only"])
