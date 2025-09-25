@@ -18,6 +18,15 @@ Thumbs.db
 # Ignore raw data
 data/raw/
 
-# Keep processed and models
-!data/processed/
-!models/
+# Ignore large processed datasets by default
+data/processed/*.csv
+
+# BUT allow demo dataset(s) only
+!data/processed/combined_demo.csv
+
+# Ignore model artifacts by default
+models/*
+
+# If you want to keep a small placeholder model, un-ignore it
+#!models/demo_model.joblib
+
