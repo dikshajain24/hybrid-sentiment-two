@@ -24,9 +24,6 @@ data/processed/*.csv
 # BUT allow demo dataset(s) only
 !data/processed/combined_demo.csv
 
-# Ignore model artifacts by default
+# Ignore model artifacts
 models/*
-
-# If you want to keep a small placeholder model, un-ignore it
-#!models/demo_model.joblib
-
+"@ | Set-Content -Encoding UTF8 .gitignore
